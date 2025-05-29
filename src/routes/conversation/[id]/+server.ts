@@ -26,6 +26,7 @@ import { textGeneration } from "$lib/server/textGeneration";
 import type { TextGenerationContext } from "$lib/server/textGeneration/types";
 import { logger } from "$lib/server/logger.js";
 import { documentParserToolId } from "$lib/utils/toolIds.js";
+import type { Assistant } from "$lib/types/Assistant";
 
 export async function POST({ request, locals, params, getClientAddress }) {
 	const id = z.string().parse(params.id);
@@ -333,41 +334,26 @@ export async function POST({ request, locals, params, getClientAddress }) {
 
 	let doneStreaming = false;
 
-	let lastTokenTimestamp: undefined | Date = undefined;
+	// Get the assistants for this conversation
+	const assistantIds = conv.assistantIds || (conv.assistantId ? [conv.assistantId] : []);
 
-	// we now build the stream
+	// Create the response stream
 	const stream = new ReadableStream({
 		async start(controller) {
 			messageToWriteTo.updates ??= [];
+
 			async function update(event: MessageUpdate) {
 				if (!messageToWriteTo || !conv) {
-					throw Error("No message or conversation to write events to");
+					return;
 				}
 
-				// Add token to content or skip if empty
+				// Set the initial message content
 				if (event.type === MessageUpdateType.Stream) {
-					if (event.token === "") return;
 					messageToWriteTo.content += event.token;
+				}
 
-					// add to token total
-					MetricsServer.getMetrics().model.tokenCountTotal.inc({ model: model?.id });
-
-					// if this is the first token, add to time to first token
-					if (!lastTokenTimestamp) {
-						MetricsServer.getMetrics().model.timeToFirstToken.observe(
-							{ model: model?.id },
-							Date.now() - promptedAt.getTime()
-						);
-						lastTokenTimestamp = new Date();
-					}
-
-					// add to time per token
-					MetricsServer.getMetrics().model.timePerOutputToken.observe(
-						{ model: model?.id },
-						Date.now() - (lastTokenTimestamp ?? promptedAt).getTime()
-					);
-					lastTokenTimestamp = new Date();
-				} else if (
+				// Set the reasoning
+				else if (
 					event.type === MessageUpdateType.Reasoning &&
 					event.subtype === MessageReasoningUpdateType.Stream
 				) {
@@ -435,53 +421,275 @@ export async function POST({ request, locals, params, getClientAddress }) {
 				}
 			}
 
-			await collections.conversations.updateOne(
-				{ _id: convId },
-				{ $set: { title: conv.title, updatedAt: new Date() } }
-			);
-			messageToWriteTo.updatedAt = new Date();
+			// Handle multi-expert or single-expert conversation
+			if (assistantIds.length > 1) {
+				// Multi-expert conversation: create sequential turns from each assistant
+				const assistants = await collections.assistants.find({
+					_id: { $in: assistantIds }
+				}).toArray();
 
-			let hasError = false;
-			const initialMessageContent = messageToWriteTo.content;
+				let currentMessageId = messageToWriteTo.id;
+				let currentMessagesForPrompt = [...messagesForPrompt];
 
-			try {
-				const ctx: TextGenerationContext = {
-					model,
-					endpoint: await model.getEndpoint(),
-					conv,
-					messages: messagesForPrompt,
-					assistant: undefined,
-					isContinue: isContinue ?? false,
-					webSearch: webSearch ?? false,
-					toolsPreference: [
-						...(toolsPreferences ?? []),
-						...(hasPdfFiles || hasPdfInConversation ? [documentParserToolId] : []), // Add document parser tool if PDF files are present
-					],
-					promptedAt,
-					ip: getClientAddress(),
-					username: locals.user?.username,
-				};
-				// run the text generation and send updates to the client
-				for await (const event of textGeneration(ctx)) await update(event);
-			} catch (e) {
-				hasError = true;
-				await update({
-					type: MessageUpdateType.Status,
-					status: MessageUpdateStatus.Error,
-					message: (e as Error).message,
-				});
-				logger.error(e);
-			} finally {
-				// check if no output was generated
-				if (!hasError && messageToWriteTo.content === initialMessageContent) {
+				for (let i = 0; i < assistants.length; i++) {
+					const assistant = assistants[i];
+					let currentMessageToWriteTo: Message;
+
+					if (i === 0) {
+						// Use the existing message for the first assistant
+						currentMessageToWriteTo = messageToWriteTo;
+						currentMessageToWriteTo.assistantId = assistant._id.toString();
+					} else {
+						// Create new message as child of the previous expert's message
+						const newAssistantMessageId = addChildren(
+							conv,
+							{
+								from: "assistant",
+								content: "",
+								assistantId: assistant._id.toString(),
+								createdAt: new Date(),
+								updatedAt: new Date(),
+							},
+							currentMessageId // Add as child of the previous expert's message
+						);
+						currentMessageToWriteTo = conv.messages.find(m => m.id === newAssistantMessageId)!;
+						currentMessageId = newAssistantMessageId;
+						
+						// Update the prompt to include all previous expert responses
+						currentMessagesForPrompt = buildSubtree(conv, currentMessageId);
+						currentMessagesForPrompt.pop(); // Remove the current empty message
+					}
+
+					// Send expert indicator
+					controller.enqueue(JSON.stringify({
+						type: MessageUpdateType.Status,
+						status: MessageUpdateStatus.Started,
+						message: `${assistant.name} is responding...`,
+						assistantId: assistant._id.toString()
+					}) + "\n");
+
+					currentMessageToWriteTo.updates ??= [];
+					let hasError = false;
+					const initialMessageContent = currentMessageToWriteTo.content;
+
+					// Create a new update function for this specific message
+					async function updateCurrentMessage(event: MessageUpdate) {
+						if (!currentMessageToWriteTo || !conv) {
+							return;
+						}
+
+						// Add assistantId to all events for this expert
+						const eventWithAssistant = { ...event, assistantId: assistant._id.toString() };
+
+						// Set the initial message content
+						if (event.type === MessageUpdateType.Stream) {
+							currentMessageToWriteTo.content += event.token;
+						}
+
+						// Set the reasoning
+						else if (
+							event.type === MessageUpdateType.Reasoning &&
+							event.subtype === MessageReasoningUpdateType.Stream
+						) {
+							currentMessageToWriteTo.reasoning ??= "";
+							currentMessageToWriteTo.reasoning += event.token;
+						}
+
+						// Set the title (only for first assistant)
+						else if (event.type === MessageUpdateType.Title && i === 0) {
+							conv.title = event.title;
+							await collections.conversations.updateOne(
+								{ _id: convId },
+								{ $set: { title: conv?.title, updatedAt: new Date() } }
+							);
+						}
+
+						// Set the final text and the interrupted flag
+						else if (event.type === MessageUpdateType.FinalAnswer) {
+							currentMessageToWriteTo.interrupted = event.interrupted;
+							currentMessageToWriteTo.content = initialMessageContent + event.text;
+
+							// add to latency
+							MetricsServer.getMetrics().model.latency.observe(
+								{ model: model?.id },
+								Date.now() - promptedAt.getTime()
+							);
+						}
+
+						// Add file
+						else if (event.type === MessageUpdateType.File) {
+							currentMessageToWriteTo.files = [
+								...(currentMessageToWriteTo.files ?? []),
+								{ type: "hash", name: event.name, value: event.sha, mime: event.mime },
+							];
+						}
+
+						// Append to the persistent message updates if it's not a stream update
+						if (
+							event.type !== MessageUpdateType.Stream &&
+							!(
+								event.type === MessageUpdateType.Status &&
+								event.status === MessageUpdateStatus.KeepAlive
+							) &&
+							!(
+								event.type === MessageUpdateType.Reasoning &&
+								event.subtype === MessageReasoningUpdateType.Stream
+							)
+						) {
+							currentMessageToWriteTo?.updates?.push(eventWithAssistant);
+						}
+
+						// Avoid remote keylogging attack executed by watching packet lengths
+						// by padding the text with null chars to a fixed length
+						if (event.type === MessageUpdateType.Stream) {
+							eventWithAssistant.token = event.token.padEnd(16, "\0");
+						}
+
+						// Send the update to the client
+						controller.enqueue(JSON.stringify(eventWithAssistant) + "\n");
+
+						// Send 4096 of spaces to make sure the browser doesn't blocking buffer that holding the response
+						if (event.type === MessageUpdateType.FinalAnswer) {
+							controller.enqueue(" ".repeat(4096));
+						}
+					}
+
+					try {
+						// Create context with assistant-specific preprompt
+						const assistantPrompt = assistant.preprompt || "";
+						const modifiedMessages = [...currentMessagesForPrompt];
+						if (modifiedMessages[0]?.from === "system") {
+							modifiedMessages[0] = { ...modifiedMessages[0], content: assistantPrompt };
+						}
+
+						const ctx: TextGenerationContext = {
+							model,
+							endpoint: await model.getEndpoint(),
+							conv,
+							messages: modifiedMessages,
+							assistant,
+							isContinue: isContinue ?? false,
+							webSearch: webSearch ?? false,
+							toolsPreference: [
+								...(toolsPreferences ?? []),
+								...(hasPdfFiles || hasPdfInConversation ? [documentParserToolId] : []), // Add document parser tool if PDF files are present
+							],
+							promptedAt,
+							ip: getClientAddress(),
+							username: locals.user?.username,
+						};
+
+						// run the text generation and send updates to the client
+						for await (const event of textGeneration(ctx)) {
+							await updateCurrentMessage(event);
+						}
+					} catch (e) {
+						hasError = true;
+						await updateCurrentMessage({
+							type: MessageUpdateType.Status,
+							status: MessageUpdateStatus.Error,
+							message: (e as Error).message,
+						});
+						logger.error(e);
+					} finally {
+						// check if no output was generated
+						if (!hasError && currentMessageToWriteTo.content === initialMessageContent) {
+							await updateCurrentMessage({
+								type: MessageUpdateType.Status,
+								status: MessageUpdateStatus.Error,
+								message: "No output was generated. Something went wrong.",
+							});
+						}
+					}
+
+					currentMessageToWriteTo.updatedAt = new Date();
+
+					// Update assistant stats
+					await collections.assistantStats.updateOne(
+						{ assistantId: assistant._id, "date.at": startOfHour(new Date()), "date.span": "hour" },
+						{ $inc: { count: 1 } },
+						{ upsert: true }
+					);
+
+					// Update the conversation after each expert response
+					await collections.conversations.updateOne(
+						{ _id: convId },
+						{ $set: { messages: conv.messages, title: conv?.title, updatedAt: new Date() } }
+					);
+				}
+			} else {
+				// Single expert or no expert - use existing logic
+				await collections.conversations.updateOne(
+					{ _id: convId },
+					{ $set: { title: conv.title, updatedAt: new Date() } }
+				);
+				messageToWriteTo.updatedAt = new Date();
+
+				let hasError = false;
+				const initialMessageContent = messageToWriteTo.content;
+
+				// Get the assistant if there is one
+				let assistant: Assistant | undefined;
+				if (assistantIds.length === 1) {
+					assistant = await collections.assistants.findOne({ _id: assistantIds[0] });
+					messageToWriteTo.assistantId = assistantIds[0].toString();
+				}
+
+				try {
+					// Create context with assistant-specific preprompt if available
+					const modifiedMessages = [...messagesForPrompt];
+					if (assistant?.preprompt && modifiedMessages[0]?.from === "system") {
+						modifiedMessages[0] = { ...modifiedMessages[0], content: assistant.preprompt };
+					}
+
+					const ctx: TextGenerationContext = {
+						model,
+						endpoint: await model.getEndpoint(),
+						conv,
+						messages: modifiedMessages,
+						assistant,
+						isContinue: isContinue ?? false,
+						webSearch: webSearch ?? false,
+						toolsPreference: [
+							...(toolsPreferences ?? []),
+							...(hasPdfFiles || hasPdfInConversation ? [documentParserToolId] : []), // Add document parser tool if PDF files are present
+						],
+						promptedAt,
+						ip: getClientAddress(),
+						username: locals.user?.username,
+					};
+					// run the text generation and send updates to the client
+					for await (const event of textGeneration(ctx)) await update(event);
+				} catch (e) {
+					hasError = true;
 					await update({
 						type: MessageUpdateType.Status,
 						status: MessageUpdateStatus.Error,
-						message: "No output was generated. Something went wrong.",
+						message: (e as Error).message,
 					});
+					logger.error(e);
+				} finally {
+					// check if no output was generated
+					if (!hasError && messageToWriteTo.content === initialMessageContent) {
+						await update({
+							type: MessageUpdateType.Status,
+							status: MessageUpdateStatus.Error,
+							message: "No output was generated. Something went wrong.",
+						});
+					}
+				}
+
+				// Update assistant stats for single assistant
+				if (conv.assistantId) {
+					await collections.assistantStats.updateOne(
+						{ assistantId: conv.assistantId, "date.at": startOfHour(new Date()), "date.span": "hour" },
+						{ $inc: { count: 1 } },
+						{ upsert: true }
+					);
 				}
 			}
 
+			// Update the conversation with all messages
 			await collections.conversations.updateOne(
 				{ _id: convId },
 				{ $set: { messages: conv.messages, title: conv?.title, updatedAt: new Date() } }
@@ -492,26 +700,12 @@ export async function POST({ request, locals, params, getClientAddress }) {
 
 			controller.close();
 		},
-		async cancel() {
-			if (doneStreaming) return;
-			await collections.conversations.updateOne(
-				{ _id: convId },
-				{ $set: { messages: conv.messages, title: conv.title, updatedAt: new Date() } }
-			);
-		},
 	});
-
-	if (conv.assistantId) {
-		await collections.assistantStats.updateOne(
-			{ assistantId: conv.assistantId, "date.at": startOfHour(new Date()), "date.span": "hour" },
-			{ $inc: { count: 1 } },
-			{ upsert: true }
-		);
-	}
 
 	const metrics = MetricsServer.getMetrics();
 	metrics.model.messagesTotal.inc({ model: model?.id });
-	// Todo: maybe we should wait for the message to be saved before ending the response - in case of errors
+	
+	// Return the response with proper headers
 	return new Response(stream, {
 		headers: {
 			"Content-Type": "application/jsonl",

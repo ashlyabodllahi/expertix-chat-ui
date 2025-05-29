@@ -48,21 +48,35 @@ export const load = async ({ params, depends, locals }) => {
 
 	const convertedConv = { ...conversation, ...convertLegacyConversation(conversation) };
 
+	// Load assistants - handle both single and multiple assistants
+	let assistants = [];
+	let assistant = null;
+
+	if (convertedConv.assistantIds && convertedConv.assistantIds.length > 0) {
+		// Multi-assistant conversation
+		assistants = await collections.assistants.find({
+			_id: { $in: convertedConv.assistantIds }
+		}).toArray();
+		assistants = JSON.parse(JSON.stringify(assistants));
+	} else if (convertedConv.assistantId) {
+		// Single assistant conversation (legacy)
+		assistant = await collections.assistants.findOne({
+			_id: new ObjectId(convertedConv.assistantId),
+		});
+		assistant = JSON.parse(JSON.stringify(assistant));
+		if (assistant) {
+			assistants = [assistant];
+		}
+	}
+
 	return {
 		messages: convertedConv.messages,
 		title: convertedConv.title,
 		model: convertedConv.model,
 		preprompt: convertedConv.preprompt,
 		rootMessageId: convertedConv.rootMessageId,
-		assistant: convertedConv.assistantId
-			? JSON.parse(
-					JSON.stringify(
-						await collections.assistants.findOne({
-							_id: new ObjectId(convertedConv.assistantId),
-						})
-					)
-				)
-			: null,
+		assistant, // Keep for backward compatibility
+		assistants, // New field for multi-expert
 		shared,
 	};
 };

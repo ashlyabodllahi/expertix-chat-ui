@@ -51,6 +51,7 @@
 		assistant?: Assistant | undefined;
 		preprompt?: string | undefined;
 		files?: File[];
+		assistants?: Assistant[];
 	}
 
 	let {
@@ -64,6 +65,7 @@
 		assistant = undefined,
 		preprompt = undefined,
 		files = $bindable([]),
+		assistants = $bindable([]),
 	}: Props = $props();
 
 	let isReadOnly = $derived(!models.some((model) => model.id === currentModel.id));
@@ -74,6 +76,13 @@
 	let editMsdgId: Message["id"] | null = $state(null);
 	let pastedLongContent = $state(false);
 
+	let selectedAssistants: Assistant[] = $state([]);
+
+	let isAuthor = $derived(!shared);
+	let isTapped = $state(false);  
+	let readOnly = $derived(isReadOnly);
+	let isLast = $derived((idx: number) => idx === messages.length - 1);
+
 	beforeNavigate(() => {
 		if (page.params.id) {
 			isSharedRecently = false;
@@ -81,16 +90,21 @@
 	});
 
 	const dispatch = createEventDispatcher<{
-		message: string;
+		message: { content: string; selectedAssistants: Assistant[] };
 		share: void;
 		stop: void;
 		retry: { id: Message["id"]; content?: string };
 		continue: { id: Message["id"] };
+		showAlternateMsg: { id: Message["id"] };
+		vote: { score: Message["score"]; id: Message["id"] };
 	}>();
 
 	const handleSubmit = () => {
 		if (loading) return;
-		dispatch("message", message);
+		dispatch("message", { 
+			content: message, 
+			selectedAssistants 
+		});
 		message = "";
 	};
 
@@ -232,6 +246,10 @@
 	);
 	let isFileUploadEnabled = $derived(activeMimeTypes.length > 0);
 	let focused = $state(false);
+
+	function handleSelectedAssistants(event: CustomEvent<Assistant[]>) {
+		selectedAssistants = event.detail;
+	}
 </script>
 
 <svelte:window
@@ -285,17 +303,15 @@
 				<div class="flex h-max flex-col gap-8 pb-52">
 					{#each messages as message, idx (message.id)}
 						<ChatMessage
-							{loading}
 							{message}
-							alternatives={messagesAlternatives.find((a) => a.includes(message.id)) ?? []}
+							{loading}
 							isAuthor={!shared}
+							{isTapped}
 							readOnly={isReadOnly}
 							isLast={idx === messages.length - 1}
-							bind:editMsdgId
+							assistants={assistants || []}
 							on:retry
 							on:vote
-							on:continue
-							on:showAlternateMsg
 						/>
 					{/each}
 					{#if isReadOnly}
@@ -313,6 +329,7 @@
 					}}
 					isAuthor={!shared}
 					readOnly={isReadOnly}
+					assistants={assistants || []}
 				/>
 			{:else if !assistant}
 				<ChatIntroduction
@@ -322,9 +339,13 @@
 							ev.preventDefault();
 							$loginModalOpen = true;
 						} else {
-							dispatch("message", ev.detail);
+							dispatch("message", {
+								content: ev.detail,
+								selectedAssistants
+							});
 						}
 					}}
+					on:selectedAssistants={handleSelectedAssistants}
 				/>
 			{:else}
 				<AssistantIntroduction
@@ -335,7 +356,10 @@
 							ev.preventDefault();
 							$loginModalOpen = true;
 						} else {
-							dispatch("message", ev.detail);
+							dispatch("message", {
+								content: ev.detail,
+								selectedAssistants
+							});
 						}
 					}}
 				/>
@@ -431,7 +455,7 @@
 						{:else}
 							<ChatInput
 								{assistant}
-								placeholder={isReadOnly ? "This conversation is read-only." : "Ask anything"}
+								placeholder={isReadOnly ? "This conversation is read-only." : (selectedAssistants.length > 0 ? "Ask your expert panel..." : "Type your message and select experts above...")}
 								{loading}
 								bind:value={message}
 								bind:files
@@ -442,6 +466,7 @@
 								modelHasTools={currentModel.tools}
 								modelIsMultimodal={currentModel.multimodal}
 								bind:focused
+								{selectedAssistants}
 							/>
 						{/if}
 

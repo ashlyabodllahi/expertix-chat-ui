@@ -38,6 +38,7 @@
 		alternatives?: Message["id"][];
 		editMsdgId?: Message["id"] | null;
 		isLast?: boolean;
+		assistants?: Array<{_id: string, name: string, avatar?: string}>;
 	}
 
 	let {
@@ -49,6 +50,7 @@
 		alternatives = [],
 		editMsdgId = $bindable(null),
 		isLast = false,
+		assistants = [],
 	}: Props = $props();
 
 	const dispatch = createEventDispatcher<{
@@ -126,6 +128,13 @@
 			}
 		}
 	});
+
+	// Find the assistant info for this message
+	let messageAssistant = $derived(
+		message.assistantId 
+			? assistants.find(a => a._id === message.assistantId)
+			: null
+	);
 </script>
 
 {#if message.from === "assistant"}
@@ -137,7 +146,27 @@
 		onclick={() => (isTapped = !isTapped)}
 		onkeydown={() => (isTapped = !isTapped)}
 	>
-		{#if page.data?.assistant?.avatar}
+		<!-- Expert avatar and attribution for multi-expert mode -->
+		{#if messageAssistant}
+			<div class="flex flex-col items-center gap-2">
+				<!-- Expert avatar -->
+				{#if messageAssistant.avatar}
+					<img
+						src="{base}/settings/assistants/{messageAssistant._id}/avatar.jpg"
+						alt="{messageAssistant.name} Avatar"
+						class="mt-5 h-8 w-8 flex-none select-none rounded-full shadow-lg object-cover"
+					/>
+				{:else}
+					<div class="mt-5 flex h-8 w-8 items-center justify-center rounded-full bg-gradient-to-br from-blue-500 to-blue-600 text-sm font-bold text-white shadow-lg">
+						{messageAssistant.name[0]}
+					</div>
+				{/if}
+				<!-- Expert name -->
+				<div class="text-xs font-medium text-blue-600 dark:text-blue-400 text-center">
+					{messageAssistant.name}
+				</div>
+			</div>
+		{:else if page.data?.assistant?.avatar}
 			<img
 				src="{base}/settings/assistants/{page.data.assistant._id}/avatar.jpg"
 				alt="Avatar"
@@ -150,8 +179,10 @@
 				class="mt-5 h-3 w-3 flex-none select-none rounded-full shadow-lg max-sm:hidden"
 			/>
 		{/if}
+
 		<div
 			class="relative flex min-h-[calc(2rem+theme(spacing[3.5])*2)] min-w-[60px] flex-col gap-2 break-words rounded-2xl border border-gray-100 bg-gradient-to-br from-gray-50 px-5 py-3.5 text-gray-600 prose-pre:my-2 dark:border-gray-800 dark:from-gray-800/40 dark:text-gray-300"
+			class:ml-7={messageAssistant}
 		>
 			{#if message.files?.length}
 				<div class="flex h-fit flex-wrap gap-x-5 gap-y-2">

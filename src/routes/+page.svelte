@@ -17,9 +17,11 @@
 
 	const settings = useSettingsStore();
 
-	async function createConversation(message: string) {
+	async function createConversation(messageData: { content: string; selectedAssistants?: Assistant[] }) {
 		try {
 			loading = true;
+
+			const { content, selectedAssistants = [] } = messageData;
 
 			// check if $settings.activeModel is a valid model
 			// else check if it's an assistant, and use that model
@@ -37,16 +39,25 @@
 					model = data.models[0].id;
 				}
 			}
+
+			const requestBody: any = {
+				model,
+				preprompt: $settings.customPrompts[$settings.activeModel],
+			};
+
+			// Handle multiple assistants or single assistant
+			if (selectedAssistants.length > 0) {
+				requestBody.assistantIds = selectedAssistants.map(a => a._id);
+			} else if (data.assistant?._id) {
+				requestBody.assistantId = data.assistant._id;
+			}
+
 			const res = await fetch(`${base}/conversation`, {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
 				},
-				body: JSON.stringify({
-					model,
-					preprompt: $settings.customPrompts[$settings.activeModel],
-					assistantId: data.assistant?._id,
-				}),
+				body: JSON.stringify(requestBody),
 			});
 
 			if (!res.ok) {
@@ -60,7 +71,7 @@
 
 			// Ugly hack to use a store as temp storage, feel free to improve ^^
 			pendingMessage.set({
-				content: message,
+				content,
 				files,
 			});
 
@@ -77,7 +88,7 @@
 	onMount(() => {
 		// check if there's a ?q query param with a message
 		const query = page.url.searchParams.get("q");
-		if (query) createConversation(query);
+		if (query) createConversation({ content: query });
 	});
 
 	let currentModel = $derived(

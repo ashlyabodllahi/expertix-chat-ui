@@ -2,6 +2,7 @@ import type { MessageUpdate } from "./MessageUpdate";
 import type { Timestamps } from "./Timestamps";
 import type { WebSearch } from "./WebSearch";
 import type { v4 } from "uuid";
+import type { Assistant } from "./Assistant";
 
 export type Message = Partial<Timestamps> & {
 	from: "user" | "assistant" | "system";
@@ -19,6 +20,9 @@ export type Message = Partial<Timestamps> & {
 	 **/
 	files?: MessageFile[];
 	interrupted?: boolean;
+	
+	// Track which assistant generated this message
+	assistantId?: Assistant["_id"];
 
 	// needed for conversation trees
 	ancestors?: Message["id"][];

@@ -24,6 +24,7 @@
 	import type { v4 } from "uuid";
 	import { useSettingsStore } from "$lib/stores/settings.js";
 	import { browser } from "$app/environment";
+	import SelectedExperts from "$lib/components/chat/SelectedExperts.svelte";
 
 	import "katex/dist/katex.min.css";
 	import { updateDebouncer } from "$lib/utils/updates.js";
@@ -409,15 +410,17 @@
 		}
 	});
 
-	async function onMessage(event: CustomEvent<string>) {
+	async function onMessage(event: CustomEvent<{ content: string; selectedAssistants?: Assistant[] }>) {
+		const { content } = event.detail;
+		
 		if (!data.shared) {
-			await writeMessage({ prompt: event.detail });
+			await writeMessage({ prompt: content });
 		} else {
 			await convFromShared()
 				.then(async (convId) => {
 					await goto(`${base}/conversation/${convId}`, { invalidateAll: true });
 				})
-				.then(async () => await writeMessage({ prompt: event.detail }))
+				.then(async () => await writeMessage({ prompt: content }))
 				.finally(() => (loading = false));
 		}
 	}
@@ -538,4 +541,5 @@
 	models={data.models}
 	currentModel={findCurrentModel([...data.models, ...data.oldModels], data.model)}
 	assistant={data.assistant}
+	assistants={data.assistants}
 />

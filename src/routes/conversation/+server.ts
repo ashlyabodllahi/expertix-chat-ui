@@ -22,6 +22,7 @@ export const POST: RequestHandler = async ({ locals, request }) => {
 			fromShare: z.string().optional(),
 			model: validateModel(models),
 			assistantId: z.string().optional(),
+			assistantIds: z.array(z.string()).optional(),
 			preprompt: z.string().optional(),
 		})
 		.safeParse(JSON.parse(body));
@@ -82,16 +83,34 @@ export const POST: RequestHandler = async ({ locals, request }) => {
 		error(400, "Can't start a conversation with an unlisted model");
 	}
 
-	// get preprompt from assistant if it exists
-	const assistant = await collections.assistants.findOne({
-		_id: new ObjectId(values.assistantId),
-	});
+	// Handle multiple assistants
+	let assistantIds: ObjectId[] = [];
+	let preprompts: string[] = [];
 
-	if (assistant) {
-		values.preprompt = assistant.preprompt;
-	} else {
-		values.preprompt ??= model?.preprompt ?? "";
+	if (values.assistantIds && values.assistantIds.length > 0) {
+		// Multi-assistant mode
+		const assistants = await collections.assistants.find({
+			_id: { $in: values.assistantIds.map(id => new ObjectId(id)) }
+		}).toArray();
+
+		assistantIds = assistants.map(a => a._id);
+		preprompts = assistants.map(a => a.preprompt || "");
+		
+		// Use first assistant's preprompt or model default
+		values.preprompt = preprompts[0] || model?.preprompt || "";
+	} else if (values.assistantId) {
+		// Legacy single assistant mode
+		const assistant = await collections.assistants.findOne({
+			_id: new ObjectId(values.assistantId),
+		});
+
+		if (assistant) {
+			assistantIds = [assistant._id];
+			values.preprompt = assistant.preprompt;
+		}
 	}
+
+	values.preprompt ??= model?.preprompt ?? "";
 
 	if (messages && messages.length > 0 && messages[0].from === "system") {
 		messages[0].content = values.preprompt;
@@ -104,7 +123,9 @@ export const POST: RequestHandler = async ({ locals, request }) => {
 		messages,
 		model: values.model,
 		preprompt: values.preprompt,
-		assistantId: values.assistantId ? new ObjectId(values.assistantId) : undefined,
+		// Store both for backward compatibility
+		assistantId: assistantIds[0], // legacy field
+		assistantIds: assistantIds.length > 0 ? assistantIds : undefined, // new field
 		createdAt: new Date(),
 		updatedAt: new Date(),
 		userAgent: request.headers.get("User-Agent") ?? undefined,
